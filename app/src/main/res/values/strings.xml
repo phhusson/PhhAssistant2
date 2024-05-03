@@ -1,3 +1,5 @@
 <resources>
     <string name="app_name">PhhAssistant2</string>
+    <string name="accessibility_service_description">Phh Assistant</string>
+    <string name="accessibility_service_label">Phh Assistant</string>
 </resources>
