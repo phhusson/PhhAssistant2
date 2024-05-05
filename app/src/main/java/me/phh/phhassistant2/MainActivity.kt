@@ -1,6 +1,5 @@
 package me.phh.phhassistant2
 
-import android.R.attr.path
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.accessibilityservice.GestureDescription.StrokeDescription
@@ -47,7 +46,7 @@ fun together_xyz_complete(text: String): String {
     body.put("max_tokens", 128)
     body.put("stream_tokens", false)
     body.put("stop", JSONArray(listOf("</s>", "[/INST]", "<|eot_id|>")))
-    body.put("temperature", 0.35)
+    body.put("temperature", 0.15)
     body.put("model", "meta-llama/Llama-3-70b-chat-hf")
     body.put("prompt", text)
 
@@ -75,18 +74,42 @@ fun together_xyz_complete(text: String): String {
 
 class Conversation {
     val prompt = """
-You are a helpful assistant running on a smartphone, and you have access to the user's screen. Here's a dump of an Android Activity.
+You are a helpful assistant running on an Android smartphone, and you have access to the user's screen. Here's a dump of an Android Activity.
 Everything you answer is a formatted JSON. Do not output anything other than a valid JSON object.
 This is a smartphone, so most of the interaction are using the touchscreen. Use DPAD only if you know where is the focus.
+You might need to run multiples actions to execute a task. You will be provided with the updated view tree at every step of the way.
+Wait for the view tree to update before executing the next action.
+There is no global search, you must always go inside the app first.
 
 Execute the actions the user asks you to. Here are the actions you can perform:
 You can click at a position, by answering a JSON {"function":"click", "pos": [x, y]}
 You can swipe up or down from center of the screen with {"function":"swipe", "direction": "up"} or {"function":"swipe", "direction": "down"}
-You can type text, by answering a JSON: {"function":"input_text", "text", "This is something that will be typed in current text input"}
-You can say something to the user by answering a JSON: {"function":"say", "text": "Hello world"}
+You can type text with: {"function":"input_text", "text", "This is something that will be typed in current text input"}
+You can say something to the user with: {"function":"say", "text": "Hello world"}
 You can do a global action, one of back, home, notifications, recents, dpad_up, dpad_down, dpad_left, dpad_right, dpad_center . Example: {"function":"global_action", "action": "back"}
+You can launch an app just with its name with {"function":"launch_app", "app": "app name"}
+Notify that you need to execute another action after the view refresh with {"continue":true}
 
-Provide the user with just one sentence description of what's on-screen<|eot_id|>
+Example:
+User: Enable dark mode
+System: [...] (view tree)
+Thoughts: Okay we're currently in a web browser, first launch the settings app
+{"function":"launch_app", "app": "Settings"}
+{"continue":true}
+System: [...] (view tree)
+Thoughts: We are now at the settings app. Let's click on the display settings
+{"function":"click", "pos": [100, 200]}
+{"continue":true}
+System: [...] (view tree)
+Thoughts: I can't see the dark mode there, let's scroll down a bit
+{"function":"swipe", "direction": "down"}
+{"continue":true}
+System: [...] (view tree)
+Thoughts: I can now see the dark mode setting. Let's click on the dark mode toggle
+{"function":"click", "pos": [350, 1420]}
+{"function":"say", "text": "Dark mode enabled"}
+
+Start the conversation by providing the user with just one sentence description of what's on-screen<|eot_id|>
     """.trimIndent()
     enum class Tag {
         TREE, // Description of the view tree (to be pruned)
@@ -108,8 +131,16 @@ Provide the user with just one sentence description of what's on-screen<|eot_id|
 
         Log.d("PHH-TX", "Request is $request")
         val response = together_xyz_complete(request)
-        messages.add(Message("assistant", response, Tag.ACTION))
-        Log.d("PHH-Voice", "Response is $response")
+        val response2 = response
+            .replace(Regex("assistant:"), "")
+            .split("\n")
+            .map { it.trim() }
+            // Take all the lines until one starts with System:
+            .takeWhile { !it.startsWith("System:") }
+            .joinToString("\n")
+
+        messages.add(Message("assistant", response2, Tag.ACTION))
+        Log.d("PHH-Voice", "Response is $response2")
     }
 }
 
@@ -121,6 +152,7 @@ class MyAccessibilityService : AccessibilityService() {
 
     var latestTree: AccessibilityNodeInfo? = null
 
+    var appNameCache = mutableMapOf<String, String>()
     fun browseViewNode(node: AccessibilityNodeInfo, depth: Int = 0): JSONArray {
         val json = JSONArray()
         val pos = Rect()
@@ -134,6 +166,23 @@ class MyAccessibilityService : AccessibilityService() {
             if (!child.isVisibleToUser)
                 continue
 
+            // This means the node doesn't provide any useful information. Remove the useless fields to gain few tokens
+            val isMeaninglessLayout = child.className == "android.view.View" &&
+                    child.text == null &&
+                    child.contentDescription == null
+
+            // We'll skip this node altogether in that case
+            // TODO: we'd need some img2txt to know what's in there
+            val isImageOnlyButton = child.className == "android.widget.Button" &&
+                    child.text == null &&
+                    child.contentDescription == null &&
+                    child.childCount == 0
+
+            if (isImageOnlyButton) {
+                Log.d("PHH-Voice", "\t".repeat(depth) + "Useless button with hint ${child.hintText}, error ${child.error}, state ${child.stateDescription}, tooltip ${child.tooltipText}, resourcename ${child.viewIdResourceName}, container title ${child.containerTitle}")
+                continue
+            }
+
             val ret = browseViewNode(child, depth + 1)
 
             val obj = JSONObject()
@@ -143,15 +192,50 @@ class MyAccessibilityService : AccessibilityService() {
             } else if(child.contentDescription != null) {
                 obj.put("text", child.contentDescription)
             }
-            obj.put("focused", child.isFocused)
-            obj.put("class", child.className
-                ?.replace(Regex("androidx?.widget."), ""))
+            if(child.isFocused)
+                obj.put("focused", child.isFocused)
+            if (!isMeaninglessLayout)
+                obj.put("class", child.className
+                    ?.replace(Regex("androidx?.(widget|view)."), ""))
             if (ret.length() > 0)
                 obj.put("children", ret)
-            child.getBoundsInScreen(pos)
-            obj.put("pos", JSONArray().also { it.put((pos.left + pos.right)/2); it.put((pos.top + pos.bottom)/2 )})
+
+            if(!isMeaninglessLayout) {
+                child.getBoundsInScreen(pos)
+                obj.put(
+                    "pos",
+                    JSONArray().also {
+                        it.put((pos.left + pos.right) / 2);
+                        it.put((pos.top + pos.bottom) / 2)
+                    })
+            }
             json.put(obj)
         }
+        return json
+    }
+
+
+    private fun installedApps(): JSONArray {
+        val packageManager = packageManager
+        val intent = Intent(Intent.ACTION_MAIN, null)
+        intent.addCategory(Intent.CATEGORY_LAUNCHER)
+        val resInfos = packageManager.queryIntentActivities(intent, 0)
+        val installedApps = JSONArray()
+        for (resInfo in resInfos) {
+            installedApps.put(resInfo.activityInfo.applicationInfo.loadLabel(packageManager).toString())
+            appNameCache[resInfo.activityInfo.applicationInfo.packageName] = resInfo.activityInfo.applicationInfo.loadLabel(packageManager).toString()
+        }
+        Log.d("PHH-Voice", "Installed apps are $installedApps")
+        return installedApps
+    }
+
+
+    fun jsonView(node: AccessibilityNodeInfo): JSONObject {
+        val packagename = node.packageName
+        val json = JSONObject()
+        json.put("current_app", appNameCache[packagename.toString()] ?: packagename)
+        json.put("view_tree", browseViewNode(node))
+        json.put("installed_apps", installedApps())
         return json
     }
 
@@ -178,9 +262,9 @@ class MyAccessibilityService : AccessibilityService() {
                     val input = socket.getInputStream().bufferedReader()
                     val output = socket.getOutputStream().bufferedWriter()
 
-                    val json = browseViewNode(latestTree!!)
+                    val firstJsonTree = jsonView(latestTree!!)
                     conversation = Conversation()
-                    conversation!!.messages.add(Conversation.Message("system", json.toString(), Conversation.Tag.TREE))
+                    conversation!!.messages.add(Conversation.Message("system", firstJsonTree.toString(), Conversation.Tag.TREE))
                     conversation!!.complete()
 
                     // Show the conversation to the user
@@ -193,94 +277,163 @@ class MyAccessibilityService : AccessibilityService() {
                     }
                     output.flush()
 
+                    var skipUser = false
                     while (true) {
                         val stillAlive = synchronized(this) { conversation != null }
                         if (!stillAlive)
                             break
 
-                        output.write("> ")
-                        output.flush()
-                        val str = (input.readLine() ?: break).trim()
-                        if (str == "exit")
-                            break
+                        var userStr = ""
+                        if (!skipUser) {
+                            output.write("> ")
+                            output.flush()
+                            userStr = (input.readLine() ?: break).trim()
+                            if (userStr == "exit")
+                                break
+                        }
 
                         conv.messages
                             .filter {it.tag == Conversation.Tag.TREE }
                             .forEach { conv.messages.remove(it) }
 
-                        val newJson = browseViewNode(latestTree!!)
+                        val newJson = synchronized(this) {
+                            jsonView(latestTree!!)
+                        }
                         conv.messages.add(Conversation.Message("system", newJson.toString(), Conversation.Tag.TREE))
                         output.write("refreshed tree\n")
                         output.flush()
 
-                        // Add user request to the conversation
-                        conv.messages.add(Conversation.Message("user", str, Conversation.Tag.USER))
+                        if (!skipUser) {
+                            // Add user request to the conversation
+                            conv.messages.add(Conversation.Message("user", userStr, Conversation.Tag.USER))
+
+                        }
                         conv.complete()
+                        skipUser = false
 
                         // And show the answer (the last message) to the user
                         val m = conv.messages.last()
                         output.write("${m.sender}: ${m.text}\n")
-                        try {
-                            val newStr = m.text.replace(Regex("assistant:"), "").trim()
-                            val json = JSONObject(newStr)
-                            when(json.getString("function")) {
-                                "click" -> {
-                                    val pos = json.getJSONArray("pos")
-                                    tap(PointF(pos.getDouble(0).toFloat(), pos.getDouble(1).toFloat()))
+                        output.write("Executing\n")
+                        output.flush()
+
+                        val lines = m.text
+                            .split("\n")
+                            .map { it.trim() }
+
+                        for (line in lines) {
+                            output.write("---- $line\n")
+                            output.flush()
+                            if (line.startsWith("Thoughts:"))
+                                continue
+                            try {
+                                val json = JSONObject(line)
+                                if (json.has("continue") && json.getBoolean("continue")) {
+                                    output.write("Will continue without user intervention\n")
+                                    Thread.sleep(10000) // TODO: Wait for the view to update
+                                    skipUser = true
+                                    continue
                                 }
-                                "global_action" -> {
-                                    when(json.getString("action")) {
-                                        "back" -> performGlobalAction(GLOBAL_ACTION_BACK)
-                                        "home" -> performGlobalAction(GLOBAL_ACTION_HOME)
-                                        "notifications" -> performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
-                                        "recents" -> performGlobalAction(GLOBAL_ACTION_RECENTS)
-                                        "dpad_up" -> performGlobalAction(GLOBAL_ACTION_BACK)
-                                        "dpad_down" -> performGlobalAction(GLOBAL_ACTION_BACK)
-                                        "dpad_left" -> performGlobalAction(GLOBAL_ACTION_BACK)
-                                        "dpad_right" -> performGlobalAction(GLOBAL_ACTION_BACK)
-                                        "dpad_center" -> performGlobalAction(GLOBAL_ACTION_BACK)
-                                    }
-                                }
-                                "input_text" -> {
-                                    val node = findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-                                    if(node != null) {
-                                        val arguments = Bundle()
-                                        arguments.putCharSequence(
-                                            AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
-                                            json.getString("text")
+
+                                when (json.getString("function")) {
+                                    "click" -> {
+                                        val pos = json.getJSONArray("pos")
+                                        tap(
+                                            PointF(
+                                                pos.getDouble(0).toFloat(),
+                                                pos.getDouble(1).toFloat()
+                                            )
                                         )
-                                        node.performAction(
-                                            AccessibilityNodeInfo.ACTION_SET_TEXT,
-                                            arguments
+                                    }
+
+                                    "global_action" -> {
+                                        when (json.getString("action")) {
+                                            "back" -> performGlobalAction(GLOBAL_ACTION_BACK)
+                                            "home" -> performGlobalAction(GLOBAL_ACTION_HOME)
+                                            "notifications" -> performGlobalAction(
+                                                GLOBAL_ACTION_NOTIFICATIONS
+                                            )
+
+                                            "recents" -> performGlobalAction(GLOBAL_ACTION_RECENTS)
+                                            "dpad_up" -> performGlobalAction(GLOBAL_ACTION_BACK)
+                                            "dpad_down" -> performGlobalAction(GLOBAL_ACTION_BACK)
+                                            "dpad_left" -> performGlobalAction(GLOBAL_ACTION_BACK)
+                                            "dpad_right" -> performGlobalAction(GLOBAL_ACTION_BACK)
+                                            "dpad_center" -> performGlobalAction(GLOBAL_ACTION_BACK)
+                                        }
+                                    }
+
+                                    "input_text" -> {
+                                        val node = findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                                        if (node != null) {
+                                            val arguments = Bundle()
+                                            arguments.putCharSequence(
+                                                AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                                                json.getString("text")
+                                            )
+                                            node.performAction(
+                                                AccessibilityNodeInfo.ACTION_SET_TEXT,
+                                                arguments
+                                            )
+                                            // Also send back to hide IME...
+                                            performGlobalAction(GLOBAL_ACTION_BACK)
+                                        } else {
+                                            output.write("No input field found\n")
+                                            output.flush()
+
+                                            conv.messages.add(Conversation.Message("system", "No input field found\n", Conversation.Tag.OTHER))
+                                            skipUser = true
+                                        }
+                                    }
+
+                                    "swipe" -> {
+                                        val rect = Rect()
+                                        latestTree!!.getBoundsInScreen(rect)
+                                        val center = PointF(
+                                            (rect.left + rect.right) / 2f,
+                                            (rect.top + rect.bottom) / 2f
                                         )
-                                    } else {
-                                        output.write("No input field found\n")
-                                        output.flush()
+                                        val direction = json.getString("direction")
+                                        val start = PointF(center.x, center.y)
+                                        val end = PointF(center.x, center.y)
+                                        when (direction) {
+                                            "up" -> start.y =
+                                                (rect.bottom * 0.8 + rect.top * 0.1).toFloat()
+
+                                            "down" -> start.y =
+                                                (rect.top * 0.8 + rect.bottom * 0.1).toFloat()
+                                        }
+                                        val swipe = StrokeDescription(
+                                            android.graphics.Path().apply {
+                                                moveTo(start.x, start.y); lineTo(
+                                                end.x,
+                                                end.y
+                                            )
+                                            },
+                                            0,
+                                            500
+                                        )
+                                        val builder = GestureDescription.Builder()
+                                        builder.addStroke(swipe)
+                                        dispatchGesture(builder.build(), null, null)
+                                    }
+                                    "launch_app" -> {
+                                        val pkg = appNameCache.filter { it.value == json.getString("app") }.keys.firstOrNull()
+                                        val intent = if(pkg != null) packageManager.getLaunchIntentForPackage(pkg) else null
+                                        intent?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        if (intent != null) {
+                                            startActivity(intent)
+                                        } else {
+                                            output.write("App not found\n")
+                                            output.flush()
+                                            conv.messages.add(Conversation.Message("system", "App not found\n", Conversation.Tag.OTHER))
+                                            skipUser = true
+                                        }
                                     }
                                 }
-                                "swipe" -> {
-                                    val rect = Rect()
-                                    latestTree!!.getBoundsInScreen(rect)
-                                    val center = PointF((rect.left + rect.right)/2f, (rect.top + rect.bottom)/2f)
-                                    val direction = json.getString("direction")
-                                    val start = PointF(center.x, center.y)
-                                    val end = PointF(center.x, center.y)
-                                    when(direction) {
-                                        "up" -> start.y = (rect.bottom * 0.8 + rect.top * 0.1).toFloat()
-                                        "down" -> start.y = (rect.top * 0.8 + rect.bottom * 0.1).toFloat()
-                                    }
-                                    val swipe = StrokeDescription(
-                                        android.graphics.Path().apply{ moveTo(start.x, start.y); lineTo(end.x, end.y) },
-                                        0,
-                                        500
-                                    )
-                                    val builder = GestureDescription.Builder()
-                                    builder.addStroke(swipe)
-                                    dispatchGesture(builder.build(), null, null)
-                                }
+                            } catch (e: Exception) {
+                                Log.e("PHH-Voice", "Failed to parse JSON", e)
                             }
-                        } catch (e: Exception) {
-                            Log.e("PHH-Voice", "Failed to parse JSON", e)
                         }
                     }
                 }
@@ -301,9 +454,12 @@ class MyAccessibilityService : AccessibilityService() {
         Log.d("PHH-Voice", "Accessibility event $p0")
         val p = p0.source
         if (p != null) {
-            latestTree = getRootNode(p)
+            synchronized(this) {
+                latestTree = getRootNode(p)
+            }
             // Just for logs
-            browseViewNode(latestTree!!)
+            val json = browseViewNode(latestTree!!)
+            Log.e("PHH-A11Y", "Tree is $json")
         }
     }
 
